@@ -370,12 +370,22 @@ public partial class MainWindow : Window
                 progress,
                 _operationCancellation.Token);
 
-            var failures = selectedItems.Count(item => item.Status == "失败");
+            var failures = selectedItems.Count(item => item.Status.StartsWith("失败", StringComparison.Ordinal));
             var skipped = selectedItems.Count(item => item.Status == "已跳过");
             var downloaded = selectedItems.Length - failures - skipped;
             StatusTextBlock.Text = failures == 0
                 ? $"下载完成：新增 {downloaded}，跳过已下载 {skipped}。"
                 : $"下载结束：新增 {downloaded}，跳过 {skipped}，失败 {failures}。";
+
+            if (failures > 0)
+            {
+                var details = string.Join(
+                    Environment.NewLine,
+                    selectedItems
+                        .Where(item => item.Status.StartsWith("失败", StringComparison.Ordinal))
+                        .Select(item => $"第 {item.Rank} 名：{item.Status}"));
+                MessageBox.Show(this, details, "下载失败详情", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
         catch (OperationCanceledException)
         {

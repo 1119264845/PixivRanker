@@ -1,5 +1,7 @@
 using System.IO;
+using System.IO.Compression;
 using System.Text.Json;
+using System.Windows.Media.Imaging;
 using PixivRanker.Models;
 using PixivRanker.Utils;
 
@@ -62,7 +64,7 @@ public sealed class RankingDownloadService(PixivSessionService session)
             }
             catch (Exception exception)
             {
-                item.Status = "失败";
+                item.Status = $"失败：{exception.Message}";
                 progress?.Report(new DownloadProgress(index, items.Count, $"第 {item.Rank} 名失败：{exception.Message}", item));
             }
 
@@ -138,20 +140,219 @@ public sealed class RankingDownloadService(PixivSessionService session)
             throw new InvalidOperationException("未取得动图压缩包地址。");
         }
 
-        var destination = Path.Combine(targetRoot, $"{fileBaseName}_ugoira.zip");
-        item.Status = "下载动图";
-        if (!IsNonEmptyFile(destination))
+        var frames = GetUgoiraFrames(body);
+        var gifDestination = Path.Combine(targetRoot, $"{fileBaseName}_ugoira.gif");
+        if (IsNonEmptyFile(gifDestination))
         {
-            await session.DownloadFileAsync(sourceUrl, destination, cancellationToken);
+            return;
         }
 
-        // Frame timing is required if the ZIP is later converted back into an animation.
-        if (body.TryGetProperty("frames", out var frames))
+        // Pixiv supplies ugoira as a ZIP of still images. Keep that ZIP only as a
+        // temporary conversion input, so the download directory contains the GIF
+        // the user requested instead of an archive and a separate timing file.
+        var downloadedArchivePath = Path.Combine(targetRoot, $"{fileBaseName}_ugoira.zip.download");
+        var legacyArchivePath = Path.Combine(targetRoot, $"{fileBaseName}_ugoira.zip");
+        var archivePath = IsNonEmptyFile(legacyArchivePath)
+            ? legacyArchivePath
+            : downloadedArchivePath;
+        item.Status = "下载动图";
+        if (!IsNonEmptyFile(archivePath) || !IsValidZipArchive(archivePath))
         {
-            var framePath = Path.Combine(targetRoot, $"{fileBaseName}_frames.json");
-            await File.WriteAllTextAsync(framePath, frames.GetRawText(), cancellationToken);
+            if (archivePath.Equals(downloadedArchivePath, StringComparison.OrdinalIgnoreCase))
+            {
+                TryDeleteFile(archivePath);
+            }
+
+            archivePath = downloadedArchivePath;
+            await session.DownloadFileAsync(sourceUrl, archivePath, cancellationToken);
+        }
+
+        if (!IsValidZipArchive(archivePath))
+        {
+            throw new InvalidOperationException("动图压缩包下载不完整或格式无效，请重试。");
+        }
+
+        item.Status = "正在转换 GIF";
+        await ConvertUgoiraToGifAsync(archivePath, gifDestination, frames, cancellationToken);
+
+        File.Delete(archivePath);
+    }
+
+    private static Task ConvertUgoiraToGifAsync(
+        string archivePath,
+        string gifDestination,
+        IReadOnlyList<UgoiraFrame> frames,
+        CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                ConvertUgoiraToGif(archivePath, gifDestination, frames, cancellationToken);
+                completion.TrySetResult(null);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                completion.TrySetCanceled(cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                completion.TrySetException(exception);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "PixivRanker GIF conversion"
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return completion.Task;
+    }
+
+    private static IReadOnlyList<UgoiraFrame> GetUgoiraFrames(JsonElement body)
+    {
+        if (!body.TryGetProperty("frames", out var frames) || frames.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException("未取得动图帧信息。");
+        }
+
+        var result = new List<UgoiraFrame>();
+        foreach (var frame in frames.EnumerateArray())
+        {
+            var file = frame.TryGetProperty("file", out var fileElement)
+                ? fileElement.GetString()
+                : null;
+            if (string.IsNullOrWhiteSpace(file))
+            {
+                throw new InvalidOperationException("动图帧信息不完整。");
+            }
+
+            var delay = frame.TryGetProperty("delay", out var delayElement) && delayElement.TryGetInt32(out var value)
+                ? value
+                : 60;
+            result.Add(new UgoiraFrame(file, Math.Max(0, delay)));
+        }
+
+        if (result.Count == 0)
+        {
+            throw new InvalidOperationException("动图没有可转换的帧。");
+        }
+
+        return result;
+    }
+
+    private static void ConvertUgoiraToGif(
+        string archivePath,
+        string gifDestination,
+        IReadOnlyList<UgoiraFrame> frames,
+        CancellationToken cancellationToken)
+    {
+        var temporaryPath = gifDestination + ".part";
+        try
+        {
+            using var archive = ZipFile.OpenRead(archivePath);
+            var encoder = new GifBitmapEncoder();
+
+            foreach (var frame in frames)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var entry = archive.GetEntry(frame.File) ??
+                            archive.Entries.FirstOrDefault(candidate =>
+                                candidate.Name.Equals(frame.File, StringComparison.OrdinalIgnoreCase));
+                if (entry is null)
+                {
+                    throw new InvalidOperationException($"压缩包中缺少动图帧：{frame.File}");
+                }
+
+                // ZipArchiveEntry.Open() returns a forward-only stream. WIC's
+                // JPEG/PNG decoders may seek while reading a frame, so buffer
+                // the entry into a seekable stream before creating the decoder.
+                using var entryStream = entry.Open();
+                using var stream = new MemoryStream();
+                entryStream.CopyTo(stream);
+                stream.Position = 0;
+                var decoder = BitmapDecoder.Create(
+                    stream,
+                    BitmapCreateOptions.PreservePixelFormat,
+                    BitmapCacheOption.OnLoad);
+                if (decoder.Frames.Count == 0)
+                {
+                    throw new InvalidOperationException($"无法读取动图帧：{frame.File}");
+                }
+
+                var metadata = new BitmapMetadata("gif");
+                metadata.SetQuery("/grctlext/Delay", ToGifDelay(frame.Delay));
+                metadata.SetQuery("/grctlext/Disposal", (byte)2);
+                var sourceFrame = decoder.Frames[0];
+                encoder.Frames.Add(BitmapFrame.Create(
+                    sourceFrame,
+                    sourceFrame.Thumbnail,
+                    metadata,
+                    sourceFrame.ColorContexts));
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            using var encoded = new MemoryStream();
+            encoder.Save(encoded);
+            var gifBytes = AddLoopExtension(encoded.ToArray());
+            using (var output = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                output.Write(gifBytes, 0, gifBytes.Length);
+            }
+
+            File.Move(temporaryPath, gifDestination, true);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
         }
     }
+
+    private static ushort ToGifDelay(int milliseconds) =>
+        (ushort)Math.Clamp((int)Math.Round(milliseconds / 10d, MidpointRounding.AwayFromZero), 1, ushort.MaxValue);
+
+    private static byte[] AddLoopExtension(byte[] gifBytes)
+    {
+        if (gifBytes.Length < 13 ||
+            (gifBytes[0] != (byte)'G' || gifBytes[1] != (byte)'I' || gifBytes[2] != (byte)'F'))
+        {
+            throw new InvalidDataException("GIF 编码器生成了无效的图像数据。");
+        }
+
+        var packedFields = gifBytes[10];
+        var globalColorTableLength = (packedFields & 0x80) == 0
+            ? 0
+            : 3 * (1 << ((packedFields & 0x07) + 1));
+        var insertOffset = 13 + globalColorTableLength;
+        if (insertOffset > gifBytes.Length)
+        {
+            throw new InvalidDataException("GIF 图像数据不完整。");
+        }
+
+        var loopExtension = new byte[]
+        {
+            0x21, 0xFF, 0x0B,
+            (byte)'N', (byte)'E', (byte)'T', (byte)'S', (byte)'C', (byte)'A',
+            (byte)'P', (byte)'E', (byte)'2', (byte)'.', (byte)'0',
+            0x03, 0x01, 0x00, 0x00, 0x00
+        };
+        var result = new byte[gifBytes.Length + loopExtension.Length];
+        Buffer.BlockCopy(gifBytes, 0, result, 0, insertOffset);
+        Buffer.BlockCopy(loopExtension, 0, result, insertOffset, loopExtension.Length);
+        Buffer.BlockCopy(
+            gifBytes,
+            insertOffset,
+            result,
+            insertOffset + loopExtension.Length,
+            gifBytes.Length - insertOffset);
+        return result;
+    }
+
+    private sealed record UgoiraFrame(string File, int Delay);
 
     private static bool IsAlreadyDownloaded(RankingItem item, string targetRoot)
     {
@@ -167,7 +368,7 @@ public sealed class RankingDownloadService(PixivSessionService session)
         if (item.IllustrationType == 2)
         {
             return files.Any(path =>
-                Path.GetExtension(path).Equals(".zip", StringComparison.OrdinalIgnoreCase) &&
+                Path.GetExtension(path).Equals(".gif", StringComparison.OrdinalIgnoreCase) &&
                 Path.GetFileNameWithoutExtension(path).EndsWith($"_{item.Id}_ugoira", StringComparison.OrdinalIgnoreCase));
         }
 
@@ -205,7 +406,7 @@ public sealed class RankingDownloadService(PixivSessionService session)
 
             if (item.IllustrationType == 2)
             {
-                if (files.Any(path => Path.GetExtension(path).Equals(".zip", StringComparison.OrdinalIgnoreCase)))
+                if (files.Any(path => Path.GetExtension(path).Equals(".gif", StringComparison.OrdinalIgnoreCase)))
                 {
                     return true;
                 }
@@ -228,6 +429,40 @@ public sealed class RankingDownloadService(PixivSessionService session)
 
     private static bool IsNonEmptyFile(string path) =>
         File.Exists(path) && new FileInfo(path).Length > 0;
+
+    private static bool IsValidZipArchive(string path)
+    {
+        if (!IsNonEmptyFile(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var archive = ZipFile.OpenRead(path);
+            return archive.Entries.Count > 0;
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (IOException)
+        {
+            // A later download attempt will report the real file-system error.
+        }
+    }
 
     private static JsonElement GetBody(JsonElement root)
     {
