@@ -5,7 +5,8 @@ namespace PixivRanker.Models;
 
 public sealed class RankingItem : INotifyPropertyChanged
 {
-    private string _status = "等待";
+    private string _status = "未下载";
+    private string _statusDetail = string.Empty;
 
     public int Rank { get; init; }
     public long Id { get; init; }
@@ -36,7 +37,29 @@ public sealed class RankingItem : INotifyPropertyChanged
 
             _status = value;
             OnPropertyChanged();
+            OnPropertyChanged(nameof(StatusDetail));
         }
+    }
+
+    public string StatusDetail
+    {
+        get => string.IsNullOrWhiteSpace(_statusDetail) ? Status : _statusDetail;
+        set
+        {
+            if (_statusDetail == value)
+            {
+                return;
+            }
+
+            _statusDetail = value;
+            OnPropertyChanged();
+        }
+    }
+
+    public void SetStatus(string status, string? detail = null)
+    {
+        Status = status;
+        StatusDetail = detail ?? string.Empty;
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;

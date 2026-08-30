@@ -1,5 +1,7 @@
 using System.IO;
 using System.IO.Compression;
+using System.Net;
+using System.Net.Http;
 using System.Text.Json;
 using System.Windows.Media.Imaging;
 using PixivRanker.Models;
@@ -14,27 +16,45 @@ public sealed class RankingDownloadService(PixivSessionService session)
         ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"
     };
 
-    public async Task DownloadAsync(
+    public async Task<DownloadSummary> DownloadAsync(
         IReadOnlyList<RankingItem> items,
         string downloadRoot,
         string rankingFolder,
+        IReadOnlySet<long> blacklistedUserIds,
         IProgress<DownloadProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
         Directory.CreateDirectory(downloadRoot);
-        var targetRoot = Path.Combine(downloadRoot, FileNameSanitizer.Sanitize(rankingFolder, 100));
+        var targetRoot = GetTargetRoot(downloadRoot, rankingFolder);
         Directory.CreateDirectory(targetRoot);
+        var downloaded = 0;
+        var alreadyDownloaded = 0;
+        var blacklisted = 0;
+        var failed = 0;
 
         for (var index = 0; index < items.Count; index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var item = items[index];
-            item.Status = "准备中";
+            if (blacklistedUserIds.Contains(item.UserId))
+            {
+                item.SetStatus("黑名单", $"作者 {item.UserName}（{item.UserId}）已加入黑名单，不会下载其作品。");
+                blacklisted++;
+                progress?.Report(new DownloadProgress(
+                    index + 1,
+                    items.Count,
+                    $"第 {item.Rank} 名的作者在黑名单中，已跳过（{index + 1}/{items.Count}）",
+                    item));
+                continue;
+            }
+
+            item.SetStatus("准备中");
             progress?.Report(new DownloadProgress(index, items.Count, $"正在准备第 {item.Rank} 名", item));
 
             if (IsAlreadyDownloaded(item, targetRoot))
             {
-                item.Status = "已跳过";
+                item.SetStatus("已下载", "本地已存在这项作品的完整文件。");
+                alreadyDownloaded++;
                 progress?.Report(new DownloadProgress(
                     index + 1,
                     items.Count,
@@ -55,22 +75,83 @@ public sealed class RankingDownloadService(PixivSessionService session)
                     await DownloadPagesAsync(item, targetRoot, fileBaseName, cancellationToken);
                 }
 
-                item.Status = "完成";
+                item.SetStatus("已下载", "下载完成，本地文件完整。");
+                downloaded++;
             }
             catch (OperationCanceledException)
             {
-                item.Status = "已取消";
+                item.SetStatus("未下载", "下载已取消；再次开始下载时会继续检查本地文件。");
                 throw;
+            }
+            catch (HttpRequestException exception) when (exception.StatusCode == HttpStatusCode.NotFound)
+            {
+                const string detail = "Pixiv 返回 404：该作品可能已被作者删除、设为非公开，或当前账号无权访问。";
+                item.SetStatus("不可下载", detail);
+                failed++;
+                progress?.Report(new DownloadProgress(index, items.Count, $"第 {item.Rank} 名不可下载：作品不存在或无权访问", item));
             }
             catch (Exception exception)
             {
-                item.Status = $"失败：{exception.Message}";
+                item.SetStatus("失败", exception.Message);
+                failed++;
                 progress?.Report(new DownloadProgress(index, items.Count, $"第 {item.Rank} 名失败：{exception.Message}", item));
             }
 
             progress?.Report(new DownloadProgress(index + 1, items.Count, $"已处理 {index + 1}/{items.Count}", item));
             await Task.Delay(650, cancellationToken);
         }
+
+        return new DownloadSummary(downloaded, alreadyDownloaded, blacklisted, failed);
+    }
+
+    public static string GetTargetRoot(string downloadRoot, string rankingFolder) =>
+        Path.Combine(downloadRoot, FileNameSanitizer.Sanitize(rankingFolder, 100));
+
+    public static bool IsDownloaded(RankingItem item, string downloadRoot, string rankingFolder) =>
+        IsAlreadyDownloaded(item, GetTargetRoot(downloadRoot, rankingFolder));
+
+    public static int CountLocalFiles(RankingItem item, string downloadRoot, string rankingFolder)
+    {
+        var targetRoot = GetTargetRoot(downloadRoot, rankingFolder);
+        if (!Directory.Exists(targetRoot))
+        {
+            return 0;
+        }
+
+        var fileCount = Directory.EnumerateFiles(targetRoot, "*", SearchOption.TopDirectoryOnly)
+            .Count(path => BelongsToWork(path, item.Id));
+        var folderFileCount = Directory.EnumerateDirectories(targetRoot, "*", SearchOption.TopDirectoryOnly)
+            .Where(path => Path.GetFileName(path).EndsWith($"_{item.Id}", StringComparison.OrdinalIgnoreCase))
+            .Sum(path => Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories).Count());
+        return fileCount + folderFileCount;
+    }
+
+    public static int DeleteLocalFiles(RankingItem item, string downloadRoot, string rankingFolder)
+    {
+        var targetRoot = GetTargetRoot(downloadRoot, rankingFolder);
+        if (!Directory.Exists(targetRoot))
+        {
+            return 0;
+        }
+
+        var deleted = 0;
+        foreach (var path in Directory.EnumerateFiles(targetRoot, "*", SearchOption.TopDirectoryOnly)
+                     .Where(path => BelongsToWork(path, item.Id))
+                     .ToArray())
+        {
+            File.Delete(path);
+            deleted++;
+        }
+
+        foreach (var path in Directory.EnumerateDirectories(targetRoot, "*", SearchOption.TopDirectoryOnly)
+                     .Where(path => Path.GetFileName(path).EndsWith($"_{item.Id}", StringComparison.OrdinalIgnoreCase))
+                     .ToArray())
+        {
+            deleted += Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories).Count();
+            Directory.Delete(path, true);
+        }
+
+        return deleted;
     }
 
     private async Task DownloadPagesAsync(
@@ -356,6 +437,11 @@ public sealed class RankingDownloadService(PixivSessionService session)
 
     private static bool IsAlreadyDownloaded(RankingItem item, string targetRoot)
     {
+        if (!Directory.Exists(targetRoot))
+        {
+            return false;
+        }
+
         if (IsLegacyFolderComplete(item, targetRoot))
         {
             return true;
@@ -426,6 +512,28 @@ public sealed class RankingDownloadService(PixivSessionService session)
 
     private static string BuildFileBaseName(RankingItem item) =>
         $"{item.Rank:D3}_{FileNameSanitizer.Sanitize(item.Title)}_{item.Id}";
+
+    private static bool BelongsToWork(string path, long workId)
+    {
+        var fileName = Path.GetFileName(path);
+        var marker = $"_{workId}";
+        var markerIndex = fileName.LastIndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (markerIndex < 0)
+        {
+            return false;
+        }
+
+        var suffixIndex = markerIndex + marker.Length;
+        if (suffixIndex == fileName.Length)
+        {
+            return true;
+        }
+
+        var suffix = fileName[suffixIndex..];
+        return suffix.StartsWith(".", StringComparison.Ordinal) ||
+               suffix.StartsWith("_P", StringComparison.OrdinalIgnoreCase) ||
+               suffix.StartsWith("_ugoira.", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static bool IsNonEmptyFile(string path) =>
         File.Exists(path) && new FileInfo(path).Length > 0;

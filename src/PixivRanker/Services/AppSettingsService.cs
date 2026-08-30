@@ -7,6 +7,8 @@ public sealed class AppSettings
 {
     public string DownloadPath { get; set; } = string.Empty;
     public string Theme { get; set; } = nameof(AppTheme.Dark);
+    public List<long> BlacklistedUserIds { get; set; } = [];
+    public Dictionary<long, string> BlacklistedAuthorNames { get; set; } = [];
 }
 
 public sealed class AppSettingsService

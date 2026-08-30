@@ -7,3 +7,9 @@ public sealed record DownloadProgress(
     int TotalWorks,
     string Message,
     RankingItem? CurrentItem = null);
+
+public sealed record DownloadSummary(
+    int Downloaded,
+    int AlreadyDownloaded,
+    int Blacklisted,
+    int Failed);

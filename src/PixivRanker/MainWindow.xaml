@@ -27,6 +27,9 @@
                            Foreground="{DynamicResource MutedTextBrush}" />
             </StackPanel>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <Button x:Name="SettingsButton" Content="⚙ 设置" Margin="0,0,10,0"
+                        ToolTip="管理作者黑名单" Style="{StaticResource SecondaryButtonStyle}"
+                        Click="SettingsButton_Click" />
                 <Button x:Name="ThemeButton" Content="浅色主题" Margin="0,0,14,0"
                         ToolTip="切换到浅色主题" Style="{StaticResource SecondaryButtonStyle}"
                         Click="ThemeButton_Click" />
@@ -101,7 +104,7 @@
                                Foreground="{DynamicResource MutedTextBrush}" FontSize="11" />
                 </StackPanel>
                 <TextBox Grid.Column="4" x:Name="DownloadPathTextBox" Margin="12,0,8,0"
-                         VerticalContentAlignment="Center" />
+                         VerticalContentAlignment="Center" LostFocus="DownloadPathTextBox_LostFocus" />
                 <Button Grid.Column="5" Content="选择" Style="{StaticResource SecondaryButtonStyle}"
                         Click="ChooseFolderButton_Click" />
                 <Button Grid.Column="7" x:Name="RefreshButton" Content="获取榜单"
@@ -135,7 +138,19 @@
 
                 <ListView Grid.Row="1" x:Name="RankingListView" ItemsSource="{Binding RankingItems}"
                           Background="Transparent" BorderThickness="0" Foreground="{DynamicResource TextBrush}"
-                          ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                          ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                          PreviewMouseRightButtonDown="RankingListView_PreviewMouseRightButtonDown">
+                    <ListView.ContextMenu>
+                        <ContextMenu Opened="RankingContextMenu_Opened">
+                            <MenuItem x:Name="OpenWorkMenuItem" Header="在 Pixiv 查看作品"
+                                      Click="OpenWorkMenuItem_Click" />
+                            <Separator />
+                            <MenuItem x:Name="BlacklistAuthorMenuItem" Header="加入作者黑名单"
+                                      Click="BlacklistAuthorMenuItem_Click" />
+                            <MenuItem x:Name="DeleteLocalFilesMenuItem" Header="删除本地图片…"
+                                      Click="DeleteLocalFilesMenuItem_Click" />
+                        </ContextMenu>
+                    </ListView.ContextMenu>
                     <ListView.ItemContainerStyle>
                         <Style TargetType="ListViewItem">
                             <Setter Property="HorizontalContentAlignment" Value="Stretch" />
@@ -186,8 +201,27 @@
                                            VerticalAlignment="Center" Foreground="{DynamicResource MutedTextBrush}" />
                                 <TextBlock Grid.Column="4" Text="{Binding Status}" Margin="12,0"
                                            VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
-                                           ToolTip="{Binding Status}"
-                                           Foreground="{DynamicResource MutedTextBrush}" />
+                                           ToolTip="{Binding StatusDetail}">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding Status}" Value="已下载">
+                                                    <Setter Property="Foreground" Value="#39CF75" />
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="黑名单">
+                                                    <Setter Property="Foreground" Value="#E7A13D" />
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="不可下载">
+                                                    <Setter Property="Foreground" Value="#E06A6A" />
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="失败">
+                                                    <Setter Property="Foreground" Value="#E06A6A" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
                             </Grid>
                         </DataTemplate>
                     </ListView.ItemTemplate>

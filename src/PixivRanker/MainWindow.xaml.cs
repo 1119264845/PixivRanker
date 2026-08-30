@@ -1,8 +1,10 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Input;
 using System.Windows.Media;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Win32;
@@ -19,6 +21,8 @@ public partial class MainWindow : Window
     private readonly RankingDownloadService _downloadService;
     private readonly AppSettingsService _settingsService = new();
     private readonly string _webViewUserDataFolder;
+    private readonly HashSet<long> _blacklistedUserIds;
+    private readonly Dictionary<long, string> _blacklistedAuthorNames;
     private AppSettings _settings;
     private AppTheme _currentTheme;
     private RankingContentKind _selectedContent = RankingContentKind.All;
@@ -36,6 +40,10 @@ public partial class MainWindow : Window
         _rankingService = new PixivRankingService(_session);
         _downloadService = new RankingDownloadService(_session);
         _settings = _settingsService.Load();
+        _blacklistedUserIds = [.. (_settings.BlacklistedUserIds ?? []).Where(id => id > 0)];
+        _blacklistedAuthorNames = (_settings.BlacklistedAuthorNames ?? [])
+            .Where(pair => pair.Key > 0 && _blacklistedUserIds.Contains(pair.Key))
+            .ToDictionary(pair => pair.Key, pair => pair.Value ?? string.Empty);
         _currentTheme = Enum.TryParse<AppTheme>(_settings.Theme, true, out var savedTheme)
             ? savedTheme
             : AppTheme.Dark;
@@ -242,7 +250,41 @@ public partial class MainWindow : Window
     {
         _settings.DownloadPath = DownloadPathTextBox.Text.Trim();
         _settings.Theme = _currentTheme.ToString();
+        _settings.BlacklistedUserIds = _blacklistedUserIds.Order().ToList();
+        _settings.BlacklistedAuthorNames = _blacklistedAuthorNames
+            .Where(pair => _blacklistedUserIds.Contains(pair.Key))
+            .ToDictionary(pair => pair.Key, pair => pair.Value);
         _settingsService.Save(_settings);
+    }
+
+    private void SettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        foreach (var item in RankingItems.Where(item =>
+                     _blacklistedUserIds.Contains(item.UserId) && !string.IsNullOrWhiteSpace(item.UserName)))
+        {
+            _blacklistedAuthorNames[item.UserId] = item.UserName;
+        }
+
+        var dialog = new BlacklistWindow(_blacklistedUserIds, _blacklistedAuthorNames)
+        {
+            Owner = this
+        };
+        if (dialog.ShowDialog() != true)
+        {
+            return;
+        }
+
+        _blacklistedUserIds.Clear();
+        _blacklistedUserIds.UnionWith(dialog.UserIds);
+        _blacklistedAuthorNames.Clear();
+        foreach (var (userId, authorName) in dialog.AuthorNames)
+        {
+            _blacklistedAuthorNames[userId] = authorName;
+        }
+
+        SaveSettings();
+        RefreshStoredStatuses();
+        StatusTextBlock.Text = $"黑名单已更新，共 {_blacklistedUserIds.Count} 位作者。";
     }
 
     private async void RefreshButton_Click(object sender, RoutedEventArgs e)
@@ -268,13 +310,14 @@ public partial class MainWindow : Window
                 _selectedMode,
                 _operationCancellation.Token);
 
+            _rankingDate = result.Date;
             RankingItems.Clear();
             foreach (var item in result.Items)
             {
+                ApplyStoredStatus(item);
                 RankingItems.Add(item);
             }
 
-            _rankingDate = result.Date;
             RankMaxTextBlock.Text = RankingItems.Count > 0 ? $"1–{RankingItems.Max(item => item.Rank)}" : "无数据";
             DownloadButton.IsEnabled = RankingItems.Count > 0;
             var dateText = string.IsNullOrWhiteSpace(_rankingDate) ? "最新" : _rankingDate;
@@ -357,33 +400,29 @@ public partial class MainWindow : Window
             RankingListView.ScrollIntoView(value.CurrentItem);
         });
 
-        var ageFolder = _selectedAge == AgeRestriction.R18 ? "R18" : "全年龄";
-        var dateFolder = string.IsNullOrWhiteSpace(_rankingDate) ? "最新" : _rankingDate;
-        var rankingFolder = $"{dateFolder}_{_selectedContent.ToDisplayName()}_{_selectedModeName}_{ageFolder}";
+        var rankingFolder = GetCurrentRankingFolder();
 
         try
         {
-            await _downloadService.DownloadAsync(
+            var summary = await _downloadService.DownloadAsync(
                 selectedItems,
                 root,
                 rankingFolder,
+                _blacklistedUserIds,
                 progress,
                 _operationCancellation.Token);
 
-            var failures = selectedItems.Count(item => item.Status.StartsWith("失败", StringComparison.Ordinal));
-            var skipped = selectedItems.Count(item => item.Status == "已跳过");
-            var downloaded = selectedItems.Length - failures - skipped;
-            StatusTextBlock.Text = failures == 0
-                ? $"下载完成：新增 {downloaded}，跳过已下载 {skipped}。"
-                : $"下载结束：新增 {downloaded}，跳过 {skipped}，失败 {failures}。";
+            StatusTextBlock.Text = summary.Failed == 0
+                ? $"下载完成：新增 {summary.Downloaded}，已有 {summary.AlreadyDownloaded}，黑名单跳过 {summary.Blacklisted}。"
+                : $"下载结束：新增 {summary.Downloaded}，已有 {summary.AlreadyDownloaded}，黑名单跳过 {summary.Blacklisted}，失败 {summary.Failed}。";
 
-            if (failures > 0)
+            if (summary.Failed > 0)
             {
                 var details = string.Join(
                     Environment.NewLine,
                     selectedItems
-                        .Where(item => item.Status.StartsWith("失败", StringComparison.Ordinal))
-                        .Select(item => $"第 {item.Rank} 名：{item.Status}"));
+                        .Where(item => item.Status is "失败" or "不可下载")
+                        .Select(item => $"第 {item.Rank} 名：{item.StatusDetail}"));
                 MessageBox.Show(this, details, "下载失败详情", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         }
@@ -408,6 +447,7 @@ public partial class MainWindow : Window
         IllustrationContentButton.IsEnabled = !value;
         UgoiraContentButton.IsEnabled = !value;
         AgeComboBox.IsEnabled = !value;
+        SettingsButton.IsEnabled = !value;
         ThemeButton.IsEnabled = !value;
         RankRangeTextBox.IsEnabled = !value;
         CancelButton.Visibility = value ? Visibility.Visible : Visibility.Collapsed;
@@ -438,7 +478,190 @@ public partial class MainWindow : Window
         {
             DownloadPathTextBox.Text = dialog.FolderName;
             SaveSettings();
+            RefreshStoredStatuses();
         }
+    }
+
+    private void DownloadPathTextBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (IsLoaded && !_isBusy)
+        {
+            RefreshStoredStatuses();
+        }
+    }
+
+    private string GetCurrentRankingFolder()
+    {
+        var ageFolder = _selectedAge == AgeRestriction.R18 ? "R18" : "全年龄";
+        var dateFolder = string.IsNullOrWhiteSpace(_rankingDate) ? "最新" : _rankingDate;
+        return $"{dateFolder}_{_selectedContent.ToDisplayName()}_{_selectedModeName}_{ageFolder}";
+    }
+
+    private void RefreshStoredStatuses()
+    {
+        foreach (var item in RankingItems)
+        {
+            ApplyStoredStatus(item);
+        }
+    }
+
+    private void ApplyStoredStatus(RankingItem item)
+    {
+        if (_blacklistedUserIds.Contains(item.UserId))
+        {
+            item.SetStatus("黑名单", $"作者 {item.UserName}（{item.UserId}）已加入黑名单，不会下载其作品。");
+            return;
+        }
+
+        var root = DownloadPathTextBox.Text.Trim();
+        if (!string.IsNullOrWhiteSpace(root) &&
+            RankingDownloadService.IsDownloaded(item, root, GetCurrentRankingFolder()))
+        {
+            item.SetStatus("已下载", "本地已存在这项作品的完整文件。");
+            return;
+        }
+
+        item.SetStatus("未下载", "本地尚未找到这项作品的完整文件。");
+    }
+
+    private void RankingListView_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        var row = FindVisualParent<ListViewItem>(e.OriginalSource as DependencyObject);
+        if (row is not null)
+        {
+            row.IsSelected = true;
+            row.Focus();
+        }
+        else
+        {
+            RankingListView.SelectedItem = null;
+        }
+    }
+
+    private void RankingContextMenu_Opened(object sender, RoutedEventArgs e)
+    {
+        var item = RankingListView.SelectedItem as RankingItem;
+        OpenWorkMenuItem.IsEnabled = item is { Id: > 0 };
+        BlacklistAuthorMenuItem.IsEnabled = !_isBusy && item is { UserId: > 0 };
+        BlacklistAuthorMenuItem.Header = item is not null && _blacklistedUserIds.Contains(item.UserId)
+            ? "移出作者黑名单"
+            : "加入作者黑名单";
+
+        DeleteLocalFilesMenuItem.IsEnabled = false;
+        if (!_isBusy && item is { Id: > 0 })
+        {
+            try
+            {
+                DeleteLocalFilesMenuItem.IsEnabled = RankingDownloadService.CountLocalFiles(
+                    item,
+                    DownloadPathTextBox.Text.Trim(),
+                    GetCurrentRankingFolder()) > 0;
+            }
+            catch (IOException)
+            {
+                // The delete action will remain disabled if the directory cannot be inspected.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // The delete action will remain disabled if the directory cannot be inspected.
+            }
+        }
+    }
+
+    private void OpenWorkMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        if (RankingListView.SelectedItem is not RankingItem { Id: > 0 } item)
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo($"https://www.pixiv.net/artworks/{item.Id}")
+            {
+                UseShellExecute = true
+            });
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, $"无法打开作品详情页：{exception.Message}", "打开失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void BlacklistAuthorMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isBusy || RankingListView.SelectedItem is not RankingItem { UserId: > 0 } item)
+        {
+            return;
+        }
+
+        var removed = !_blacklistedUserIds.Add(item.UserId);
+        if (removed)
+        {
+            _blacklistedUserIds.Remove(item.UserId);
+            _blacklistedAuthorNames.Remove(item.UserId);
+        }
+        else if (!string.IsNullOrWhiteSpace(item.UserName))
+        {
+            _blacklistedAuthorNames[item.UserId] = item.UserName;
+        }
+
+        SaveSettings();
+        RefreshStoredStatuses();
+        StatusTextBlock.Text = removed
+            ? $"已将作者 {item.UserName} 移出黑名单。"
+            : $"已将作者 {item.UserName} 加入黑名单；今后会自动跳过该作者的作品。";
+    }
+
+    private void DeleteLocalFilesMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isBusy || RankingListView.SelectedItem is not RankingItem item)
+        {
+            return;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            $"确定删除第 {item.Rank} 名《{item.Title}》的本地图片吗？\n\n只会删除当前榜单目录中作品 ID {item.Id} 对应的文件。",
+            "删除本地图片",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            MessageBoxResult.No);
+        if (confirmation != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        try
+        {
+            var deleted = RankingDownloadService.DeleteLocalFiles(
+                item,
+                DownloadPathTextBox.Text.Trim(),
+                GetCurrentRankingFolder());
+            ApplyStoredStatus(item);
+            StatusTextBlock.Text = deleted > 0
+                ? $"已删除第 {item.Rank} 名的 {deleted} 个本地文件。"
+                : $"未找到第 {item.Rank} 名的本地图片。";
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            MessageBox.Show(this, $"删除本地图片失败：{exception.Message}", "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private static T? FindVisualParent<T>(DependencyObject? child) where T : DependencyObject
+    {
+        while (child is not null)
+        {
+            if (child is T match)
+            {
+                return match;
+            }
+
+            child = VisualTreeHelper.GetParent(child);
+        }
+
+        return null;
     }
 
     private void RankRangeTextBox_TextChanged(object sender, TextChangedEventArgs e)
